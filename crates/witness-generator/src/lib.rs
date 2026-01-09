@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use reth_stateless::StatelessInput;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 pub mod eest_generator;
 pub mod rpc_generator;
@@ -178,25 +179,35 @@ pub trait FixtureGenerator: Sync {
     async fn generate(&self) -> Result<Vec<Box<dyn Fixture>>>;
 
     /// Generates fixtures and writes each to a JSON file in the specified directory.
+    /// Continues on individual fixture failures, logging warnings for any that fail.
     async fn generate_to_path(&self, path: &Path) -> Result<usize> {
         let bws = self.generate().await?;
+        let mut count = 0;
         for bw in &bws {
             let output_path = path.join(format!("{}.json", bw.name()));
             let mut buf = Vec::new();
             let mut serializer = serde_json::Serializer::pretty(&mut buf);
-            erased_serde::serialize(bw.as_ref(), &mut serializer).map_err(|e| {
-                WGError::FixtureSerializationError {
-                    name: bw.name().to_owned(),
-                    source: e,
-                }
-            })?;
+            if let Err(e) = erased_serde::serialize(bw.as_ref(), &mut serializer) {
+                warn!(
+                    "Failed to serialize fixture '{}': {}, skipping",
+                    bw.name(),
+                    e
+                );
+                continue;
+            }
 
-            std::fs::write(&output_path, buf).map_err(|e| WGError::FixtureWriteError {
-                path: output_path.display().to_string(),
-                source: e,
-            })?;
+            if let Err(e) = std::fs::write(&output_path, buf) {
+                warn!(
+                    "Failed to write fixture '{}' to '{}': {}, skipping",
+                    bw.name(),
+                    output_path.display(),
+                    e
+                );
+                continue;
+            }
+            count += 1;
         }
-        Ok(bws.len())
+        Ok(count)
     }
 }
 

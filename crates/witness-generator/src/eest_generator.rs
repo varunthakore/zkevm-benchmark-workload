@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use tracing::error;
+use tracing::{error, warn};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{Fixture, FixtureGenerator, Result, StatelessValidationFixture, WGError};
@@ -158,10 +158,16 @@ impl FixtureGenerator for EESTFixtureGenerator {
             tests.extend(file_tests);
         }
 
-        let bws = tests
+        let bws: Vec<Box<dyn Fixture>> = tests
             .par_iter()
-            .map(|(name, case)| gen_fixture(name, case))
-            .collect::<Result<Vec<_>>>()?;
+            .filter_map(|(name, case)| match gen_fixture(name, case) {
+                Ok(fixture) => Some(fixture),
+                Err(e) => {
+                    warn!("Failed to generate fixture for test '{}': {}", name, e);
+                    None
+                }
+            })
+            .collect();
 
         Ok(bws)
     }

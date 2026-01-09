@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
 use jsonrpsee::{
     http_client::{HeaderMap, HttpClient, HttpClientBuilder},
-    tracing::{error, info},
+    tracing::{error, info, warn},
 };
 use reth_chainspec::{Chain, HOLESKY, HOODI, NamedChain, SEPOLIA, mainnet_chain_config};
 use reth_ethereum_primitives::TransactionSigned;
@@ -150,7 +150,7 @@ impl FixtureGenerator for RpcFixtureGenerator {
 
         // Handle one block case
         if let Some(block) = self.block {
-            return Ok(vec![self.fetch_specific_block(block).await?]);
+            return Ok(self.fetch_specific_block(block).await.into_iter().collect());
         }
 
         Ok(vec![])
@@ -207,7 +207,7 @@ impl RpcFixtureGenerator {
 
         let mut blocks_and_witnesses = Vec::with_capacity(hashes.len());
         for (block_num, block_hash) in hashes {
-            let block = EthApiClient::<
+            let block = match EthApiClient::<
                 TransactionRequest,
                 Transaction,
                 Block<TransactionSigned>,
@@ -216,15 +216,39 @@ impl RpcFixtureGenerator {
                 TransactionSigned,
             >::block_by_hash(&self.client, block_hash, true)
             .await
-            .map_err(|e| WGError::RpcError(e.to_string()))?
-            .ok_or(WGError::BlockNotFoundForHash(block_hash.to_string()))?;
+            {
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    warn!(
+                        "Block {} (hash {}) not found, skipping",
+                        block_num, block_hash
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to fetch block {} (hash {}): {}, skipping",
+                        block_num, block_hash, e
+                    );
+                    continue;
+                }
+            };
 
-            let witness = DebugApiClient::<()>::debug_execution_witness_by_block_hash(
+            let witness = match DebugApiClient::<()>::debug_execution_witness_by_block_hash(
                 &self.client,
                 block_hash,
             )
             .await
-            .map_err(|e| WGError::RpcError(e.to_string()))?;
+            {
+                Ok(witness) => witness,
+                Err(e) => {
+                    warn!(
+                        "Failed to fetch witness for block {} (hash {}): {}, skipping",
+                        block_num, block_hash, e
+                    );
+                    continue;
+                }
+            };
 
             let bw = Box::new(StatelessValidationFixture {
                 name: format!("rpc_block_{block_num}"),
@@ -247,30 +271,44 @@ impl RpcFixtureGenerator {
     /// # Arguments
     /// * `block_num` - The block number to fetch
     ///
-    /// # Errors
-    /// Returns an error if the RPC call fails or if the block cannot be found.
-    async fn fetch_specific_block(&self, block_num: u64) -> Result<Box<dyn Fixture>> {
+    /// # Returns
+    /// `Some(fixture)` if successful, `None` if the block cannot be fetched (with a warning logged).
+    async fn fetch_specific_block(&self, block_num: u64) -> Option<Box<dyn Fixture>> {
         // Fetch the execution witness for the given block
-        let witness = DebugApiClient::<()>::debug_execution_witness(
+        let witness = match DebugApiClient::<()>::debug_execution_witness(
             &self.client,
             BlockNumberOrTag::Number(block_num),
         )
         .await
-        .map_err(|e| WGError::RpcError(e.to_string()))?;
+        {
+            Ok(witness) => witness,
+            Err(e) => {
+                warn!("Failed to fetch witness for block {}: {}, skipping", block_num, e);
+                return None;
+            }
+        };
 
         // Fetch the block details
-        let block =
-            EthApiClient::<
-                TransactionRequest,
-                Transaction,
-                Block<TransactionSigned>,
-                Receipt,
-                Header,
-                TransactionSigned,
-            >::block_by_number(&self.client, BlockNumberOrTag::Number(block_num), true)
-            .await
-            .map_err(|e| WGError::RpcError(e.to_string()))?
-            .ok_or(WGError::BlockNotFoundForNumber(block_num))?;
+        let block = match EthApiClient::<
+            TransactionRequest,
+            Transaction,
+            Block<TransactionSigned>,
+            Receipt,
+            Header,
+            TransactionSigned,
+        >::block_by_number(&self.client, BlockNumberOrTag::Number(block_num), true)
+        .await
+        {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                warn!("Block {} not found, skipping", block_num);
+                return None;
+            }
+            Err(e) => {
+                warn!("Failed to fetch block {}: {}, skipping", block_num, e);
+                return None;
+            }
+        };
 
         let bw = StatelessValidationFixture {
             name: format!("rpc_block_{block_num}"),
@@ -282,7 +320,7 @@ impl RpcFixtureGenerator {
             success: true,
         };
 
-        Ok(Box::new(bw))
+        Some(Box::new(bw))
     }
 
     /// Fetches blocks from a specific block number to the latest block and their execution witnesses.
@@ -291,11 +329,11 @@ impl RpcFixtureGenerator {
     /// * `block_num` - The starting block number to fetch
     ///
     /// # Returns
-    /// A vector of `BlockAndWitness` objects for all blocks in the range
+    /// A vector of `BlockAndWitness` objects for all blocks in the range (skipping any that fail)
     ///
     /// # Errors
     ///
-    /// Returns an error if any RPC call fails or if blocks cannot be found.
+    /// Returns an error if the latest block cannot be fetched.
     async fn fetch_from_block(&self, block_num: u64) -> Result<Vec<Box<dyn Fixture>>> {
         let latest_block = EthApiClient::<
             TransactionRequest,
@@ -311,7 +349,9 @@ impl RpcFixtureGenerator {
 
         let mut bws = Vec::new();
         for n in block_num..=latest_block.header.number {
-            bws.push(self.fetch_specific_block(n).await?);
+            if let Some(fixture) = self.fetch_specific_block(n).await {
+                bws.push(fixture);
+            }
         }
 
         Ok(bws)
